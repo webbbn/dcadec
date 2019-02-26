@@ -34,6 +34,13 @@ struct dcadec_stream_info {
 };
 
 /**
+ * Create DTS stream for in-memory parsing.
+ *
+ * @return      Stream handle on success, NULL on failure.
+ */
+DCADEC_API struct dcadec_stream *dcadec_stream_create();
+
+/**
  * Open DTS stream from file or standard input.
  *
  * @param name  Name of the file to be opened. Pass NULL to open standard input.
@@ -68,6 +75,30 @@ DCADEC_API void dcadec_stream_close(struct dcadec_stream *stream);
  *              failure.
  */
 DCADEC_API int dcadec_stream_read(struct dcadec_stream *stream, uint8_t **data, size_t *size);
+
+/**
+ * Establish synchronization and read the next packet from DTS stream read from a memory buffer.
+ *
+ * @param stream    Stream handle.
+ *
+ * @param data  Filled with pointer to packet data. This data is only
+ *              valid until the next call to dcadec_stream_read() or
+ *              dcadec_stream_close() functions. Packet data is padded
+ *              with DCADEC_BUFFER_PADDING bytes at the end and can be
+ *              directly passed to dcadec_context_parse() function.
+ *
+ * @param size  Filled with size of packet data, in bytes.
+ *
+ * @param in_data  The input data buffer to read from.
+ *
+ * @param size  The size of the input data buffer in bytes.
+ *
+ * @return      Positive value on success, 0 on EOF, negative error code on
+ *              failure.
+ */
+DCADEC_API int dcadec_stream_parse(struct dcadec_stream *stream,
+				   const uint8_t *in_data, uint16_t in_data_size,
+				   uint8_t **data, size_t *size);
 
 /**
  * Return DTS stream progress percentage based on current file position.

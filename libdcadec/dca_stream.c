@@ -183,6 +183,23 @@ rewind:
     return fseeko(stream->fp, 0, SEEK_SET);
 }
 
+DCADEC_API struct dcadec_stream *dcadec_stream_create()
+{
+    struct dcadec_stream *stream = ta_znew(NULL, struct dcadec_stream);
+    if (!stream)
+        return NULL;
+    stream->fp = 0;
+
+    if (!(stream->buffer = ta_zalloc_size(stream, BUFFER_ALIGN * 2)))
+        goto fail1;
+
+    return stream;
+
+fail1:
+    ta_free(stream);
+    return NULL;
+}
+
 DCADEC_API struct dcadec_stream *dcadec_stream_open(const char *name, int flags)
 {
     (void)flags;
@@ -346,6 +363,83 @@ static int read_frame(struct dcadec_stream *stream, uint32_t *sync_p)
     return 1;
 }
 
+static int parse_frame(struct dcadec_stream *stream, uint32_t *sync_p,
+		              const uint8_t *data, uint16_t data_size)
+{
+    uint8_t header[DCADEC_FRAME_HEADER_SIZE], *buf;
+    size_t frame_size;
+    int ret;
+    uint16_t data_index = 0;
+
+    // Start with a backed up sync word. If there is none, advance one byte at
+    // a time until proper sync word is read from the input byte stream.
+    uint32_t sync = stream->backup_sync;
+    while (data_index < data_size
+	   && sync != SYNC_WORD_CORE
+	   && sync != SYNC_WORD_EXSS
+	   && sync != SYNC_WORD_CORE_LE
+	   && sync != SYNC_WORD_EXSS_LE
+	   && sync != SYNC_WORD_CORE_LE14
+        && sync != SYNC_WORD_CORE_BE14) {
+        uint8_t c = data[data_index++];
+        sync = (sync << 8) | c;
+    }
+    if (data_index == data_size) {
+        return -101;
+    }
+
+    // Tried to read the second (EXSS) frame and it was core again. Back up
+    // the sync word just read and return.
+    if ((sync != SYNC_WORD_EXSS && sync != SYNC_WORD_EXSS_LE) && !sync_p) {
+        stream->backup_sync = sync;
+        return -DCADEC_ENOSYNC;
+    }
+
+    // Clear backed up sync word
+    stream->backup_sync = 0;
+
+    // Restore sync word
+    header[0] = (sync >> 24) & 0xff;
+    header[1] = (sync >> 16) & 0xff;
+    header[2] = (sync >>  8) & 0xff;
+    header[3] = (sync >>  0) & 0xff;
+
+    // Read the frame header
+    if ((data_size - data_index) < (int)(sizeof(header) - 4)) {
+        return -3;
+    }
+    memcpy(header + 4, data + data_index, sizeof(header) - 4);
+    data_index += sizeof(header) - 4;
+
+    // Parse and validate the frame header
+    if ((ret = dcadec_frame_parse_header(header, &frame_size)) < 0)
+        return ret;
+
+    // Reallocate packet buffer
+    if (!(buf = prepare_packet_buffer(stream, dcadec_frame_buffer_size(frame_size))))
+        return -DCADEC_ENOMEM;
+
+    // Restore frame header
+    memcpy(buf, header, sizeof(header));
+
+    // Read the rest of the frame
+    if ((data_size - data_index) < (int)(frame_size - sizeof(header))) {
+        return -4;
+    }
+    memcpy(buf + sizeof(header), data + data_index, frame_size - sizeof(header));
+ 
+    // Convert the frame in place
+    if ((ret = dcadec_frame_convert_bitstream(buf, &frame_size, buf, frame_size)) < 0)
+        return ret;
+
+    // Align frame size to 4-byte boundary
+    stream->packet_size += DCA_ALIGN(frame_size, 4);
+
+    if (sync_p)
+        *sync_p = sync;
+    return 1;
+}
+
 DCADEC_API int dcadec_stream_read(struct dcadec_stream *stream, uint8_t **data, size_t *size)
 {
     uint32_t sync;
@@ -380,6 +474,52 @@ DCADEC_API int dcadec_stream_read(struct dcadec_stream *stream, uint8_t **data, 
     } else {
         stream->core_plus_exss = false;
     }
+
+    *data = stream->buffer;
+    *size = stream->packet_size;
+
+    stream->packet_size = 0;
+    return 1;
+}
+
+DCADEC_API int dcadec_stream_parse(struct dcadec_stream *stream,
+				      const uint8_t *in_data, uint16_t in_data_size,
+				      uint8_t **data, size_t *size)
+{
+    uint32_t sync;
+    int ret;
+
+    if (!stream || !data || !size)
+        return -DCADEC_EINVAL;
+
+    // Loop until valid DTS core or standalone EXSS frame is read or EOF is
+    // reached
+    while (true) {
+        ret = parse_frame(stream, &sync, in_data, in_data_size);
+        if (ret == 1)
+            break;
+        if (ret == 0)
+            return ferror(stream->fp) ? -DCADEC_EIO : 0;
+        if (ret < 0 && ret != -DCADEC_ENOSYNC)
+            return ret;
+    }
+
+#if 0
+    // Check for EXSS that may follow core frame and try to concatenate both
+    // frames into single packet
+    if (sync == SYNC_WORD_CORE || sync == SYNC_WORD_CORE_LE) {
+        ret = read_frame(stream, NULL);
+        if (ret < 0 && ret != -DCADEC_ENOSYNC)
+            return ret;
+        // If the previous frame was core + EXSS, skip the incomplete (core
+        // only) frame at end of file
+        if (ret == 0 && stream->core_plus_exss)
+            return 0;
+        stream->core_plus_exss = (ret == 1);
+    } else {
+        stream->core_plus_exss = false;
+    }
+#endif
 
     *data = stream->buffer;
     *size = stream->packet_size;
